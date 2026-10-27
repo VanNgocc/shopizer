@@ -1,0 +1,233 @@
+name: DevSecOps - Stage 3 Docker Security
+
+on:
+  push:
+    branches:
+      - "baseline-3.2.5"
+  pull_request: {}
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  security-events: write
+
+concurrency:
+  group: devsecops-stage3-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE_NAME: shopizer-backend:3.2.5
+  TRIVY_VERSION: "0.76.1"
+  ENFORCE_GATE: "false"
+
+jobs:
+  docker-security:
+    name: Dockerfile, Image Scan, and SBOM
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Setup Java 11
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "11"
+          cache: maven
+
+      - name: Build Shopizer backend
+        id: maven
+        run: |
+          set -euo pipefail
+          chmod +x ./mvnw
+          ./mvnw -B -DskipTests install
+
+      - name: Verify Dockerfile and JAR
+        id: verify
+        run: |
+          set -euo pipefail
+          test -f sm-shop/Dockerfile
+          test -f sm-shop/target/shopizer.jar
+
+      - name: Hadolint - Dockerfile lint
+        id: hadolint
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          docker run --rm -i hadolint/hadolint:latest \
+            hadolint --format json - \
+            < sm-shop/Dockerfile > hadolint-report.json
+          docker run --rm -i hadolint/hadolint:latest \
+            hadolint --failure-threshold warning - \
+            < sm-shop/Dockerfile
+
+      - name: Build Docker image
+        id: docker-build
+        run: |
+          set -euo pipefail
+          docker build \
+            -f sm-shop/Dockerfile \
+            -t "$IMAGE_NAME" \
+            sm-shop
+
+      - name: Prepare reports directory
+        if: always()
+        run: mkdir -p reports
+
+      - name: Scan image with Trivy
+        id: trivy
+        if: steps.docker-build.outcome == 'success'
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.cache/trivy" reports
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$HOME/.cache/trivy:/root/.cache/" \
+            -v "$PWD/reports:/reports" \
+            "aquasec/trivy:${TRIVY_VERSION}" \
+            image --scanners vuln \
+            --format json \
+            --output /reports/trivy-image.json \
+            "$IMAGE_NAME"
+
+      - name: Convert Trivy JSON to SARIF
+        if: always() && hashFiles('reports/trivy-image.json') != ''
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -v "$PWD/reports:/reports" \
+            "aquasec/trivy:${TRIVY_VERSION}" \
+            convert \
+            --format sarif \
+            --output /reports/trivy-image.sarif \
+            /reports/trivy-image.json
+
+      - name: Generate image SBOM (CycloneDX)
+        id: sbom
+        if: always() && steps.docker-build.outcome == 'success'
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.cache/trivy" reports
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$HOME/.cache/trivy:/root/.cache/" \
+            -v "$PWD/reports:/reports" \
+            "aquasec/trivy:${TRIVY_VERSION}" \
+            image --format cyclonedx \
+            --output /reports/image-sbom.cdx.json \
+            "$IMAGE_NAME"
+
+      - name: Upload SARIF to GitHub Code Scanning
+        if: always() && hashFiles('reports/trivy-image.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: reports/trivy-image.sarif
+          category: trivy-image
+
+      - name: Summarize Trivy image findings
+        if: always() && hashFiles('reports/trivy-image.json') != ''
+        run: |
+          set -euo pipefail
+          report="reports/trivy-image.json"
+
+          critical=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' "$report")
+          high=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' "$report")
+          medium=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' "$report")
+          low=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' "$report")
+          unknown=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="UNKNOWN" or .Severity==null)] | length' "$report")
+          total=$((critical + high + medium + low + unknown))
+
+          {
+            echo "## Docker Security — Trivy Image"
+            echo ""
+            echo "**Image:** \`$IMAGE_NAME\`"
+            echo ""
+            echo "| Severity | Findings |"
+            echo "|---|---:|"
+            echo "| Critical | $critical |"
+            echo "| High | $high |"
+            echo "| Medium | $medium |"
+            echo "| Low | $low |"
+            echo "| Unknown | $unknown |"
+            echo "| **Total** | **$total** |"
+            echo ""
+            echo "> Counts are vulnerability records in the Trivy report, not necessarily unique CVEs."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Summarize Hadolint findings
+        if: always()
+        run: |
+          {
+            echo ""
+            echo "## Hadolint — Dockerfile"
+            echo ""
+            if [ -s hadolint-report.json ]; then
+              count=$(jq 'length' hadolint-report.json)
+              error_count=$(jq '[.[] | select(.level=="error")] | length' hadolint-report.json)
+              warning_count=$(jq '[.[] | select(.level=="warning")] | length' hadolint-report.json)
+              info_count=$(jq '[.[] | select(.level=="info" or .level=="style" or .level=="ignore")] | length' hadolint-report.json)
+              echo "| Level | Findings |"
+              echo "|---|---:|"
+              echo "| Error | $error_count |"
+              echo "| Warning | $warning_count |"
+              echo "| Info/Style/Other | $info_count |"
+              echo "| **Total** | **$count** |"
+            else
+              echo "Hadolint JSON report was not generated."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Generate overall workflow summary
+        if: always()
+        env:
+          MAVEN_OUTCOME: ${{ steps.maven.outcome }}
+          VERIFY_OUTCOME: ${{ steps.verify.outcome }}
+          HADOLINT_OUTCOME: ${{ steps.hadolint.outcome }}
+          DOCKER_OUTCOME: ${{ steps.docker-build.outcome }}
+          TRIVY_OUTCOME: ${{ steps.trivy.outcome }}
+          SBOM_OUTCOME: ${{ steps.sbom.outcome }}
+          SARIF_EXISTS: ${{ hashFiles('reports/trivy-image.sarif') != '' }}
+          SBOM_EXISTS: ${{ hashFiles('reports/image-sbom.cdx.json') != '' }}
+          TRIVY_JSON_EXISTS: ${{ hashFiles('reports/trivy-image.json') != '' }}
+          HADOLINT_REPORT_EXISTS: ${{ hashFiles('hadolint-report.json') != '' }}
+        run: |
+          {
+            echo ""
+            echo "## Overall Docker Security Summary"
+            echo ""
+            echo "| Check | Outcome |"
+            echo "|---|---|"
+            echo "| Maven build (JDK 11) | ${MAVEN_OUTCOME:-not run} |"
+            echo "| Dockerfile/JAR verification | ${VERIFY_OUTCOME:-not run} |"
+            echo "| Hadolint | ${HADOLINT_OUTCOME:-not run} |"
+            echo "| Docker image build | ${DOCKER_OUTCOME:-not run} |"
+            echo "| Trivy image scan | ${TRIVY_OUTCOME:-not run} |"
+            echo "| Trivy JSON report | ${TRIVY_JSON_EXISTS} |"
+            echo "| Trivy SARIF report | ${SARIF_EXISTS} |"
+            echo "| Hadolint JSON report | ${HADOLINT_REPORT_EXISTS} |"
+            echo "| CycloneDX SBOM | ${SBOM_EXISTS} |"
+            echo "| SBOM generation step | ${SBOM_OUTCOME:-not run} |"
+            echo ""
+            echo "### Quality gate"
+            echo ""
+            echo "ENFORCE_GATE=${ENFORCE_GATE}. Critical/High enforcement is disabled for baseline analysis."
+            echo ""
+            echo "### Uploaded artifact"
+            echo ""
+            echo "Artifact name: \`docker-security-reports\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload Docker security reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-security-reports
+          path: |
+            reports/
+            hadolint-report.json
+          if-no-files-found: ignore
+          retention-days: 30
