@@ -1,0 +1,228 @@
+{
+  "info": {
+    "name": "Shopizer - Session regression (CVE-2022-23063)",
+    "description": "Sau khi đổi mật khẩu, token đăng nhập cũ PHẢI bị từ chối. Bản dính lỗi vẫn trả 200 với token cũ.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "baseUrl", "value": "http://localhost:8080" },
+    { "key": "password", "value": "OldPassw0rd!123" },
+    { "key": "newPassword", "value": "NewPassw0rd!456" },
+    { "key": "email", "value": "" },
+    { "key": "tokenOld", "value": "" }
+  ],
+  "item": [
+    {
+      "name": "01 Đăng ký khách hàng thử nghiệm",
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.collectionVariables.set('email', 'sectest+' + Date.now() + '@example.com');"
+            ]
+          }
+        },
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('Đăng ký thành công (2xx)', function () {",
+              "  pm.expect(pm.response.code).to.be.within(200, 299);",
+              "});"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "url": {
+          "raw": "{{baseUrl}}/api/v1/customer/register",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "v1", "customer", "register"]
+        },
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"emailAddress\": \"{{email}}\",\n  \"userName\": \"{{email}}\",\n  \"password\": \"{{password}}\",\n  \"repeatPassword\": \"{{password}}\",\n  \"firstName\": \"Sec\",\n  \"lastName\": \"Test\",\n  \"gender\": \"M\",\n  \"storeCode\": \"DEFAULT\",\n  \"language\": \"en\",\n  \"billing\": {\n    \"firstName\": \"Sec\",\n    \"lastName\": \"Test\",\n    \"address\": \"1 Test Street\",\n    \"city\": \"New York\",\n    \"postalCode\": \"10001\",\n    \"country\": \"US\",\n    \"stateProvince\": \"NY\"\n  }\n}"
+        }
+      }
+    },
+    {
+      "name": "02 Đăng nhập, lấy token cũ",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('Đăng nhập trả 200', function () {",
+              "  pm.response.to.have.status(200);",
+              "});",
+              "var body = pm.response.json();",
+              "pm.test('Có token trong phản hồi', function () {",
+              "  pm.expect(body.token).to.be.a('string').and.not.empty;",
+              "});",
+              "pm.collectionVariables.set('tokenOld', body.token);"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "url": {
+          "raw": "{{baseUrl}}/api/v1/customer/login",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "v1", "customer", "login"]
+        },
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"username\": \"{{email}}\",\n  \"password\": \"{{password}}\"\n}"
+        }
+      }
+    },
+    {
+      "name": "03 Đối chứng: token cũ dùng được TRƯỚC khi đổi mật khẩu",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('Token hợp lệ truy cập được hồ sơ (200)', function () {",
+              "  pm.response.to.have.status(200);",
+              "});"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "header": [{ "key": "Authorization", "value": "Bearer {{tokenOld}}" }],
+        "url": {
+          "raw": "{{baseUrl}}/api/v1/auth/customer/profile",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "v1", "auth", "customer", "profile"]
+        }
+      }
+    },
+    {
+      "name": "04 Đổi mật khẩu bằng token cũ",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('Đổi mật khẩu thành công (2xx)', function () {",
+              "  pm.expect(pm.response.code).to.be.within(200, 299);",
+              "});"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "Authorization", "value": "Bearer {{tokenOld}}" }
+        ],
+        "url": {
+          "raw": "{{baseUrl}}/api/v1/auth/customer/password",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "v1", "auth", "customer", "password"]
+        },
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"username\": \"{{email}}\",\n  \"current\": \"{{password}}\",\n  \"password\": \"{{newPassword}}\",\n  \"repeatPassword\": \"{{newPassword}}\"\n}"
+        }
+      }
+    },
+    {
+      "name": "05 [CVE-2022-23063] Token cũ phải bị từ chối SAU khi đổi mật khẩu",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('CVE-2022-23063: token cũ bị từ chối sau khi đổi mật khẩu (401/403)', function () {",
+              "  pm.expect(pm.response.code, 'Token cũ vẫn dùng được => phiên không hết hạn đúng cách').to.be.oneOf([401, 403]);",
+              "});"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "header": [{ "key": "Authorization", "value": "Bearer {{tokenOld}}" }],
+        "url": {
+          "raw": "{{baseUrl}}/api/v1/auth/customer/profile",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "v1", "auth", "customer", "profile"]
+        }
+      }
+    },
+    {
+      "name": "06 Đối chứng: đăng nhập bằng mật khẩu mới thành công",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('Mật khẩu mới đăng nhập được (200)', function () {",
+              "  pm.response.to.have.status(200);",
+              "});"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "url": {
+          "raw": "{{baseUrl}}/api/v1/customer/login",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "v1", "customer", "login"]
+        },
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"username\": \"{{email}}\",\n  \"password\": \"{{newPassword}}\"\n}"
+        }
+      }
+    },
+    {
+      "name": "07 Đối chứng: mật khẩu cũ không còn đăng nhập được",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('Mật khẩu cũ bị từ chối (4xx)', function () {",
+              "  pm.expect(pm.response.code).to.be.within(400, 499);",
+              "});"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "url": {
+          "raw": "{{baseUrl}}/api/v1/customer/login",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "v1", "customer", "login"]
+        },
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"username\": \"{{email}}\",\n  \"password\": \"{{password}}\"\n}"
+        }
+      }
+    }
+  ]
+}

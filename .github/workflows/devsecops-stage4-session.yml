@@ -1,0 +1,165 @@
+# DevSecOps pipeline - Giai đoạn 4a: test hồi quy bảo mật cho lỗi session (CVE-2022-23063)
+# Đặt file này tại: .github/workflows/devsecops-stage4-session.yml
+# Đặt collection tại: security-tests/session-regression.postman_collection.json
+#
+# Quy trình: build -> tạo database.properties (H2) -> chạy app nền -> đợi sẵn sàng
+#            -> Newman chạy collection -> tổng hợp -> quality gate.
+# Chỉ chạy trên ứng dụng tự dựng trong runner (localhost).
+#
+# ENFORCE_GATE = "false": chỉ báo cáo (baseline). "true": pipeline đỏ nếu test hồi quy fail.
+
+name: DevSecOps - Giai đoạn 4a (Session regression)
+
+on:
+  pull_request:
+  push:
+    branches: [baseline-3.2.5]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: devsecops-stage4-session-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ENFORCE_GATE: "false"
+  NEWMAN_VERSION: "6.2.1" # kiểm tra lại bản mới nhất trên npm trước khi chốt
+  APP_URL: "http://localhost:8080"
+  READY_TIMEOUT_SECONDS: "180"
+  COLLECTION: "security-tests/session-regression.postman_collection.json"
+
+jobs:
+  session-regression:
+    name: Security regression test (Newman)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Chọn JDK 11
+        run: |
+          set -euo pipefail
+          test -n "${JAVA_HOME_11_X64:-}" || { echo "::error::Runner không có JDK 11 cài sẵn"; exit 1; }
+          echo "JAVA_HOME=${JAVA_HOME_11_X64}" >> "$GITHUB_ENV"
+          echo "${JAVA_HOME_11_X64}/bin" >> "$GITHUB_PATH"
+
+      - name: Cache Maven
+        uses: actions/cache@v6.1.0
+        with:
+          path: ~/.m2/repository
+          key: maven-${{ hashFiles('**/pom.xml') }}
+          restore-keys: |
+            maven-
+
+      - name: Tạo database.properties (H2) từ profile docker
+        run: |
+          set -euo pipefail
+          cp sm-shop/src/main/resources/profiles/docker/database.properties \
+             sm-shop/src/main/resources/database.properties
+
+      - name: Build và cài các module vào Maven local
+        run: |
+          set -euo pipefail
+          chmod +x ./mvnw
+          ./mvnw -B -DskipTests install
+
+      - name: Chạy ứng dụng nền
+        run: |
+          set -euo pipefail
+          cd sm-shop
+          nohup ../mvnw -B spring-boot:run > "${GITHUB_WORKSPACE}/app.log" 2>&1 &
+          echo $! > "${GITHUB_WORKSPACE}/app.pid"
+
+      - name: Đợi ứng dụng sẵn sàng
+        run: |
+          set -euo pipefail
+          deadline=$(( $(date +%s) + READY_TIMEOUT_SECONDS ))
+          until curl -sf -o /dev/null "${APP_URL}/v2/api-docs"; do
+            if ! kill -0 "$(cat app.pid)" 2>/dev/null; then
+              echo "::error::Ứng dụng đã dừng trước khi sẵn sàng. 80 dòng log cuối:"
+              tail -n 80 app.log
+              exit 1
+            fi
+            if [ "$(date +%s)" -ge "${deadline}" ]; then
+              echo "::error::Quá ${READY_TIMEOUT_SECONDS}s mà ứng dụng chưa sẵn sàng."
+              tail -n 80 app.log
+              exit 1
+            fi
+            sleep 5
+          done
+          echo "Ứng dụng đã sẵn sàng."
+
+      - name: Chạy Newman
+        id: newman
+        run: |
+          set -uo pipefail
+          mkdir -p newman-out
+          rc=0
+          npx --yes "newman@${NEWMAN_VERSION}" run "${COLLECTION}" \
+            --env-var "baseUrl=${APP_URL}" \
+            --reporters cli,json,junit \
+            --reporter-json-export newman-out/newman-report.json \
+            --reporter-junit-export newman-out/newman-junit.xml \
+            --timeout-request 30000 || rc=$?
+          echo "Newman exit code: ${rc}"
+          echo "rc=${rc}" >> "$GITHUB_OUTPUT"
+
+      - name: Tổng hợp kết quả
+        id: result
+        run: |
+          set -euo pipefail
+          test -f newman-out/newman-report.json || { echo "::error::Không có newman-report.json"; exit 1; }
+          total=$(jq '.run.stats.assertions.total' newman-out/newman-report.json)
+          failed=$(jq '.run.stats.assertions.failed' newman-out/newman-report.json)
+          # Test hồi quy phải thật sự chạy; 0 assertion nghĩa là collection không chạy được.
+          if [ "${total}" = "0" ]; then
+            echo "::error::Newman không chạy được assertion nào."
+            exit 1
+          fi
+          echo "total=${total}" >> "$GITHUB_OUTPUT"
+          echo "failed=${failed}" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Session regression (CVE-2022-23063)"
+            echo ""
+            echo "Assertion: **${total}**, thất bại: **${failed}**"
+            echo ""
+            if [ "${failed}" = "0" ]; then
+              echo "Kết quả: **PASS** - token cũ bị từ chối sau khi đổi mật khẩu."
+            else
+              echo "Các assertion thất bại:"
+              echo ""
+              jq -r '.run.failures[] | "- " + (.error.test // .error.name // "?") + " (" + (.source.name // "?") + ")"' newman-out/newman-report.json
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Dừng ứng dụng
+        if: ${{ always() }}
+        run: |
+          if [ -f app.pid ]; then
+            pkill -P "$(cat app.pid)" || true
+            kill "$(cat app.pid)" 2>/dev/null || true
+          fi
+
+      - name: Lưu báo cáo
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: session-regression-report
+          path: |
+            newman-out/
+            app.log
+          if-no-files-found: ignore
+          retention-days: 30
+
+      - name: Quality gate - session regression
+        if: ${{ env.ENFORCE_GATE == 'true' && steps.result.outputs.failed != '0' }}
+        run: |
+          echo "::error::Test hồi quy session thất bại (${{ steps.result.outputs.failed }} assertion). Có thể lỗi CVE-2022-23063 còn tồn tại."
+          exit 1
