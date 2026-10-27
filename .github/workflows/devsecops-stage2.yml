@@ -1,0 +1,165 @@
+# DevSecOps pipeline - Giai đoạn 2: DAST (OWASP ZAP API scan)
+# Đặt file này tại: .github/workflows/devsecops-stage2.yml (trên nhánh baseline-3.2.5)
+#
+# Quy trình: build -> tạo database.properties (H2) -> chạy app nền -> đợi sẵn sàng
+#            -> ZAP API scan theo /v2/api-docs -> tổng hợp -> quality gate.
+# Chỉ quét ứng dụng tự dựng trên runner (localhost), không quét bản demo công khai.
+#
+# Lần chạy đầu để ENFORCE_GATE = "false" (baseline). Bật "true" khi làm quality gate.
+
+name: DevSecOps - Giai đoạn 2 (DAST)
+
+on:
+  pull_request:
+  push:
+    branches: [baseline-3.2.5]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: devsecops-stage2-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ENFORCE_GATE: "false"
+  # Nên ghim phiên bản/digest cụ thể sau khi chạy thử (xem trang phát hành của ZAP).
+  ZAP_IMAGE: "ghcr.io/zaproxy/zaproxy:stable"
+  APP_URL: "http://localhost:8080"
+  READY_TIMEOUT_SECONDS: "180" # máy cục bộ khởi động ~11s; runner chậm hơn nên đặt rộng
+
+jobs:
+  dast-zap:
+    name: DAST (ZAP API scan)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Chọn JDK 11
+        run: |
+          set -euo pipefail
+          test -n "${JAVA_HOME_11_X64:-}" || { echo "::error::Runner không có JDK 11 cài sẵn"; exit 1; }
+          echo "JAVA_HOME=${JAVA_HOME_11_X64}" >> "$GITHUB_ENV"
+          echo "${JAVA_HOME_11_X64}/bin" >> "$GITHUB_PATH"
+
+      - name: Cache Maven
+        uses: actions/cache@v6.1.0
+        with:
+          path: ~/.m2/repository
+          key: maven-${{ hashFiles('**/pom.xml') }}
+          restore-keys: |
+            maven-
+
+      - name: Tạo database.properties (H2) từ profile docker
+        run: |
+          set -euo pipefail
+          # Tag 3.2.5 không commit file này (bị .gitignore), nên phải tạo từ profile.
+          cp sm-shop/src/main/resources/profiles/docker/database.properties \
+             sm-shop/src/main/resources/database.properties
+
+      - name: Build và cài các module vào Maven local
+        run: |
+          set -euo pipefail
+          chmod +x ./mvnw
+          java -version
+          ./mvnw -B -DskipTests install
+
+      - name: Chạy ứng dụng nền
+        run: |
+          set -euo pipefail
+          cd sm-shop
+          nohup ../mvnw -B spring-boot:run > "${GITHUB_WORKSPACE}/app.log" 2>&1 &
+          echo $! > "${GITHUB_WORKSPACE}/app.pid"
+
+      - name: Đợi ứng dụng sẵn sàng
+        run: |
+          set -euo pipefail
+          deadline=$(( $(date +%s) + READY_TIMEOUT_SECONDS ))
+          until curl -sf -o /dev/null "${APP_URL}/v2/api-docs"; do
+            if ! kill -0 "$(cat app.pid)" 2>/dev/null; then
+              echo "::error::Ứng dụng đã dừng trước khi sẵn sàng. 80 dòng log cuối:"
+              tail -n 80 app.log
+              exit 1
+            fi
+            if [ "$(date +%s)" -ge "${deadline}" ]; then
+              echo "::error::Quá ${READY_TIMEOUT_SECONDS}s mà ứng dụng chưa sẵn sàng."
+              tail -n 80 app.log
+              exit 1
+            fi
+            sleep 5
+          done
+          echo "Ứng dụng đã sẵn sàng."
+          grep "Started ShopApplication" app.log || true
+
+      - name: Tải OpenAPI để lưu làm bằng chứng
+        run: |
+          set -euo pipefail
+          mkdir -p zap-out
+          curl -sSf "${APP_URL}/v2/api-docs" -o zap-out/openapi.json
+          jq -r '"OpenAPI " + (.swagger // .openapi // "?") + ", số path: " + (.paths | length | tostring)' zap-out/openapi.json
+
+      - name: ZAP API scan
+        run: |
+          set -uo pipefail
+          # Container ZAP chạy với user không phải root, cần quyền ghi vào thư mục báo cáo.
+          chmod 777 zap-out
+          # --network host để container truy cập được localhost:8080 của runner.
+          # -f openapi: ZAP đọc định nghĩa Swagger 2.0/OpenAPI trực tiếp từ URL.
+          # -I: không fail theo cảnh báo của ZAP; quality gate bên dưới tự quyết định.
+          docker run --rm --network host -v "${PWD}/zap-out:/zap/wrk:rw" "${ZAP_IMAGE}" \
+            zap-api-scan.py \
+              -t "${APP_URL}/v2/api-docs" -f openapi \
+              -r zap-report.html -J zap-report.json \
+              -T 20 -I
+          echo "ZAP exit code: $?"
+          ls -la zap-out
+
+      - name: Tổng hợp kết quả
+        id: result
+        run: |
+          set -euo pipefail
+          test -f zap-out/zap-report.json || { echo "::error::Không có zap-report.json"; exit 1; }
+          high=$(jq '[.site[]?.alerts[]? | select(.riskcode=="3")] | length' zap-out/zap-report.json)
+          echo "high=${high}" >> "$GITHUB_OUTPUT"
+          {
+            echo "### ZAP API scan"
+            echo ""
+            echo "| Mức độ | Số loại cảnh báo |"
+            echo "|---|---|"
+            jq -r '[.site[]?.alerts[]? | (.riskdesc | split(" ")[0])]
+                   | group_by(.) | map("| \(.[0]) | \(length) |") | .[]' zap-out/zap-report.json
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Dừng ứng dụng
+        if: ${{ always() }}
+        run: |
+          if [ -f app.pid ]; then
+            pkill -P "$(cat app.pid)" || true
+            kill "$(cat app.pid)" 2>/dev/null || true
+          fi
+
+      - name: Lưu báo cáo
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: zap-report
+          path: |
+            zap-out/zap-report.html
+            zap-out/zap-report.json
+            zap-out/openapi.json
+            app.log
+          if-no-files-found: ignore
+          retention-days: 30
+
+      - name: Quality gate - DAST
+        if: ${{ env.ENFORCE_GATE == 'true' && steps.result.outputs.high != '0' }}
+        run: |
+          echo "::error::ZAP phát hiện ${{ steps.result.outputs.high }} loại cảnh báo mức High."
+          exit 1
