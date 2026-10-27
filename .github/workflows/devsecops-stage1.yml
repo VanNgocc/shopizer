@@ -32,7 +32,7 @@ env:
   ENFORCE_GATE: "false" # "true" = fail pipeline khi vượt ngưỡng
   GITLEAKS_VERSION: "8.30.0"
   SEMGREP_VERSION: "1.170.0"
-  TRIVY_VERSION: "<0.76.1>"
+  TRIVY_VERSION: "0.76.1"
   TRIVY_IGNORE_UNFIXED: "false" # "true" = bỏ qua lỗ hổng chưa có bản vá
 
 jobs:
