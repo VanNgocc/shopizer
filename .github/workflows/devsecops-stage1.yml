@@ -198,7 +198,9 @@ jobs:
           set -euo pipefail
           chmod +x ./mvnw
           java -version
-          ./mvnw -B -ntp -DskipTests package
+          ./mvnw -B -DskipTests \
+            -Dorg.slf4j.simpleLogger.log.org.apache.maven.cli.transfer.Slf4jMavenTransferListener=warn \
+            package
 
       - name: Cài Trivy (có kiểm tra checksum)
         run: |
