@@ -1,0 +1,264 @@
+# DevSecOps pipeline - Giai đoạn 1: secret scanning + SAST + SCA
+# Đặt file này tại: .github/workflows/devsecops-stage1.yml (trên nhánh mặc định của fork)
+#
+# Chuẩn bị trước khi chạy:
+#   1. Tạo repository secret NVD_API_KEY (xin khóa miễn phí tại nvd.nist.gov/developers/request-an-api-key).
+#   2. Fork Shopizer, tạo nhánh từ tag 3.2.5 và đặt làm nhánh mặc định của fork.
+#   3. Lần chạy đầu để ENFORCE_GATE = "false" (chế độ baseline: chỉ báo cáo, không làm fail).
+#      Đến tuần bật quality gate thì đổi thành "true".
+
+name: DevSecOps - Giai đoạn 1
+
+on:
+  pull_request:
+  push:
+    branches: [main, master, baseline-3.2.5]
+  schedule:
+    - cron: "0 2 * * 1" # Thứ Hai hằng tuần (UTC), để bắt CVE mới công bố
+  workflow_dispatch:
+
+# Quyền tối thiểu cho toàn workflow; từng job xin thêm khi cần.
+permissions:
+  contents: read
+
+concurrency:
+  group: devsecops-stage1-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ENFORCE_GATE: "false" # "true" = fail pipeline khi vượt ngưỡng
+  FAIL_ON_CVSS: "7" # Ngưỡng CVSS chặn build của Dependency-Check khi bật gate
+  GITLEAKS_VERSION: "8.30.0"
+  SEMGREP_VERSION: "1.170.0"
+  DEPCHECK_VERSION: "12.2.2"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  secrets-scan:
+    name: Secret scanning (gitleaks)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    steps:
+      - name: Checkout (lấy đủ lịch sử git)
+        uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Cài gitleaks (có kiểm tra checksum)
+        run: |
+          set -euo pipefail
+          base="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}"
+          file="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -sSfL "${base}/${file}" -o "${file}"
+          curl -sSfL "${base}/gitleaks_${GITLEAKS_VERSION}_checksums.txt" -o checksums.txt
+          grep " ${file}\$" checksums.txt | sha256sum -c -
+          tar -xzf "${file}" gitleaks
+          ./gitleaks version
+
+      - name: Quét secret trong toàn bộ lịch sử commit
+        run: |
+          ./gitleaks git --redact \
+            --report-format sarif --report-path gitleaks.sarif \
+            --exit-code 0
+
+      - name: Tổng hợp kết quả
+        id: result
+        run: |
+          count=$(jq '[.runs[]?.results[]?] | length' gitleaks.sarif)
+          echo "count=${count}" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Gitleaks"
+            echo ""
+            echo "Số secret nghi ngờ: **${count}**"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Đẩy SARIF lên GitHub Code Scanning
+        if: ${{ always() && hashFiles('gitleaks.sarif') != '' }}
+        uses: github/codeql-action/upload-sarif@v4.37.3
+        with:
+          sarif_file: gitleaks.sarif
+          category: gitleaks
+
+      - name: Lưu báo cáo
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: gitleaks-report
+          path: gitleaks.sarif
+          if-no-files-found: ignore
+          retention-days: 30
+
+      - name: Quality gate - secret
+        if: ${{ env.ENFORCE_GATE == 'true' && steps.result.outputs.count != '0' }}
+        run: |
+          echo "::error::Phát hiện ${{ steps.result.outputs.count }} secret nghi ngờ. Xem tab Security hoặc artifact gitleaks-report."
+          exit 1
+
+  # ---------------------------------------------------------------------------
+  sast-semgrep:
+    name: SAST (Semgrep)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Cài Semgrep
+        run: |
+          set -euo pipefail
+          python3 -m venv "${RUNNER_TEMP}/semgrep-venv"
+          "${RUNNER_TEMP}/semgrep-venv/bin/pip" install --quiet "semgrep==${SEMGREP_VERSION}"
+          "${RUNNER_TEMP}/semgrep-venv/bin/semgrep" --version
+
+      - name: Quét SAST
+        env:
+          SEMGREP_SEND_METRICS: "off"
+        run: |
+          "${RUNNER_TEMP}/semgrep-venv/bin/semgrep" scan \
+            --config p/java \
+            --config p/owasp-top-ten \
+            --config p/security-audit \
+            --exclude "**/src/test/**" \
+            --metrics=off \
+            --sarif --output semgrep.sarif
+
+      - name: Tổng hợp kết quả
+        id: result
+        run: |
+          total=$(jq '[.runs[]?.results[]?] | length' semgrep.sarif)
+          errors=$(jq '[.runs[]?.results[]? | select(.level=="error")] | length' semgrep.sarif)
+          echo "total=${total}" >> "$GITHUB_OUTPUT"
+          echo "errors=${errors}" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Semgrep"
+            echo ""
+            echo "Tổng số phát hiện: **${total}** (mức ERROR: **${errors}**)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Đẩy SARIF lên GitHub Code Scanning
+        if: ${{ always() && hashFiles('semgrep.sarif') != '' }}
+        uses: github/codeql-action/upload-sarif@v4.37.3
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep
+
+      - name: Lưu báo cáo
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: semgrep-report
+          path: semgrep.sarif
+          if-no-files-found: ignore
+          retention-days: 30
+
+      - name: Quality gate - SAST
+        if: ${{ env.ENFORCE_GATE == 'true' && steps.result.outputs.errors != '0' }}
+        run: |
+          echo "::error::Semgrep phát hiện ${{ steps.result.outputs.errors }} lỗi mức ERROR."
+          exit 1
+
+  # ---------------------------------------------------------------------------
+  sca-dependency-check:
+    name: SCA (OWASP Dependency-Check)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60 # Lần đầu tải dữ liệu NVD có thể lâu
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Chọn JDK 11
+        run: |
+          set -euo pipefail
+          test -n "${JAVA_HOME_11_X64:-}" || { echo "::error::Runner không có JDK 11 cài sẵn"; exit 1; }
+          echo "JAVA_HOME=${JAVA_HOME_11_X64}" >> "$GITHUB_ENV"
+          echo "${JAVA_HOME_11_X64}/bin" >> "$GITHUB_PATH"
+
+      - name: Tính khóa cache theo tuần
+        id: week
+        run: echo "week=$(date -u +%G-W%V)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache dữ liệu NVD của Dependency-Check
+        uses: actions/cache@v6.1.0
+        with:
+          path: ~/dc-data
+          key: dc-data-${{ steps.week.outputs.week }}
+          restore-keys: |
+            dc-data-
+
+      - name: Build và chạy Dependency-Check
+        env:
+          NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
+          # Khi gate tắt, đặt ngưỡng 11 (không bao giờ fail)
+          GATE_CVSS: ${{ env.ENFORCE_GATE == 'true' && env.FAIL_ON_CVSS || '11' }}
+        run: |
+          set -euo pipefail
+          chmod +x ./mvnw
+          java -version
+          nvd_args=()
+          if [ -n "${NVD_API_KEY}" ]; then
+            nvd_args=("-DnvdApiKey=${NVD_API_KEY}")
+          else
+            echo "::warning::Chưa có secret NVD_API_KEY, việc tải dữ liệu NVD sẽ rất chậm."
+          fi
+          # Chạy cùng lúc với package để Maven resolve được các module nội bộ (sm-core, sm-shop...)
+          ./mvnw -B -ntp -DskipTests \
+            package \
+            "org.owasp:dependency-check-maven:${DEPCHECK_VERSION}:aggregate" \
+            "${nvd_args[@]}" \
+            -DdataDirectory="${HOME}/dc-data" \
+            -Dformats=HTML,JSON,SARIF \
+            -DfailBuildOnCVSS="${GATE_CVSS}" \
+            -DossindexAnalyzerEnabled=false
+
+      - name: Tổng hợp kết quả
+        if: ${{ always() }}
+        run: |
+          report="target/dependency-check-report.json"
+          if [ ! -f "${report}" ]; then
+            echo "Không tìm thấy ${report}" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          {
+            echo "### OWASP Dependency-Check"
+            echo ""
+            echo "| Mức độ | Số lỗ hổng |"
+            echo "|---|---|"
+            jq -r '[.dependencies[]?.vulnerabilities[]? | (.severity // "UNKNOWN") | ascii_upcase]
+                   | group_by(.) | map("| \(.[0]) | \(length) |") | .[]' "${report}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Đẩy SARIF lên GitHub Code Scanning
+        if: ${{ always() && hashFiles('target/dependency-check-report.sarif') != '' }}
+        uses: github/codeql-action/upload-sarif@v4.37.3
+        with:
+          sarif_file: target/dependency-check-report.sarif
+          category: dependency-check
+
+      - name: Lưu báo cáo
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: dependency-check-report
+          path: |
+            target/dependency-check-report.html
+            target/dependency-check-report.json
+            target/dependency-check-report.sarif
+          if-no-files-found: ignore
+          retention-days: 30
