@@ -1,11 +1,14 @@
-# DevSecOps pipeline - Giai đoạn 1: secret scanning + SAST + SCA
+# DevSecOps pipeline - Giai đoạn 1: secret scanning + SAST + SCA (Trivy) + SBOM
 # Đặt file này tại: .github/workflows/devsecops-stage1.yml (trên nhánh mặc định của fork)
 #
 # Chuẩn bị trước khi chạy:
-#   1. Tạo repository secret NVD_API_KEY (xin khóa miễn phí tại nvd.nist.gov/developers/request-an-api-key).
-#   2. Fork Shopizer, tạo nhánh từ tag 3.2.5 và đặt làm nhánh mặc định của fork.
+#   1. Fork Shopizer, tạo nhánh từ tag 3.2.5 và đặt làm nhánh mặc định của fork.
+#   2. Điền TRIVY_VERSION trong khối env bên dưới (xem bản mới nhất ở trang Releases
+#      của aquasecurity/trivy, ghi số phiên bản không kèm chữ "v", ví dụ 0.xx.x).
 #   3. Lần chạy đầu để ENFORCE_GATE = "false" (chế độ baseline: chỉ báo cáo, không làm fail).
 #      Đến tuần bật quality gate thì đổi thành "true".
+#
+# Ghi chú: SCA dùng Trivy thay cho OWASP Dependency-Check vì không cần NVD API key.
 
 name: DevSecOps - Giai đoạn 1
 
@@ -27,10 +30,10 @@ concurrency:
 
 env:
   ENFORCE_GATE: "false" # "true" = fail pipeline khi vượt ngưỡng
-  FAIL_ON_CVSS: "7" # Ngưỡng CVSS chặn build của Dependency-Check khi bật gate
   GITLEAKS_VERSION: "8.30.0"
   SEMGREP_VERSION: "1.170.0"
-  DEPCHECK_VERSION: "12.2.2"
+  TRIVY_VERSION: "<0.76.1>"
+  TRIVY_IGNORE_UNFIXED: "false" # "true" = bỏ qua lỗ hổng chưa có bản vá
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -169,10 +172,10 @@ jobs:
           exit 1
 
   # ---------------------------------------------------------------------------
-  sca-dependency-check:
-    name: SCA (OWASP Dependency-Check)
+  sca-trivy:
+    name: SCA + SBOM (Trivy)
     runs-on: ubuntu-24.04
-    timeout-minutes: 60 # Lần đầu tải dữ liệu NVD có thể lâu
+    timeout-minutes: 30
     permissions:
       contents: read
       security-events: write
@@ -190,75 +193,87 @@ jobs:
           echo "JAVA_HOME=${JAVA_HOME_11_X64}" >> "$GITHUB_ENV"
           echo "${JAVA_HOME_11_X64}/bin" >> "$GITHUB_PATH"
 
-      - name: Tính khóa cache theo tuần
-        id: week
-        run: echo "week=$(date -u +%G-W%V)" >> "$GITHUB_OUTPUT"
-
-      - name: Cache dữ liệu NVD của Dependency-Check
-        uses: actions/cache@v6.1.0
-        with:
-          path: ~/dc-data
-          key: dc-data-${{ steps.week.outputs.week }}
-          restore-keys: |
-            dc-data-
-
-      - name: Build và chạy Dependency-Check
-        env:
-          NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
-          # Khi gate tắt, đặt ngưỡng 11 (không bao giờ fail)
-          GATE_CVSS: ${{ env.ENFORCE_GATE == 'true' && env.FAIL_ON_CVSS || '11' }}
+      - name: Build (để Maven resolve đủ dependency và module nội bộ)
         run: |
           set -euo pipefail
           chmod +x ./mvnw
           java -version
-          nvd_args=()
-          if [ -n "${NVD_API_KEY}" ]; then
-            nvd_args=("-DnvdApiKey=${NVD_API_KEY}")
-          else
-            echo "::warning::Chưa có secret NVD_API_KEY, việc tải dữ liệu NVD sẽ rất chậm."
-          fi
-          # Chạy cùng lúc với package để Maven resolve được các module nội bộ (sm-core, sm-shop...)
-          ./mvnw -B -ntp -DskipTests \
-            package \
-            "org.owasp:dependency-check-maven:${DEPCHECK_VERSION}:aggregate" \
-            "${nvd_args[@]}" \
-            -DdataDirectory="${HOME}/dc-data" \
-            -Dformats=HTML,JSON,SARIF \
-            -DfailBuildOnCVSS="${GATE_CVSS}" \
-            -DossindexAnalyzerEnabled=false
+          ./mvnw -B -ntp -DskipTests package
+
+      - name: Cài Trivy (có kiểm tra checksum)
+        run: |
+          set -euo pipefail
+          case "${TRIVY_VERSION}" in
+            *"<"*|"") echo "::error::Chưa điền TRIVY_VERSION trong khối env"; exit 1 ;;
+          esac
+          base="https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}"
+          file="trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          curl -sSfL "${base}/${file}" -o "${file}"
+          curl -sSfL "${base}/trivy_${TRIVY_VERSION}_checksums.txt" -o trivy-checksums.txt
+          grep " ${file}\$" trivy-checksums.txt | sha256sum -c -
+          tar -xzf "${file}" trivy
+          ./trivy --version
+
+      - name: Tính khóa cache theo tuần
+        id: week
+        run: echo "week=$(date -u +%G-W%V)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache CSDL lỗ hổng của Trivy
+        uses: actions/cache@v6.1.0
+        with:
+          path: ~/.cache/trivy
+          key: trivy-db-${{ steps.week.outputs.week }}
+          restore-keys: |
+            trivy-db-
+
+      - name: Quét SCA
+        run: |
+          set -euo pipefail
+          args=()
+          if [ "${TRIVY_IGNORE_UNFIXED}" = "true" ]; then args+=(--ignore-unfixed); fi
+          ./trivy fs . --scanners vuln \
+            --format json --output trivy-report.json "${args[@]}"
+          ./trivy convert --format sarif --output trivy.sarif trivy-report.json
+
+      - name: Tạo SBOM (CycloneDX)
+        run: ./trivy fs . --format cyclonedx --output sbom.cdx.json
 
       - name: Tổng hợp kết quả
-        if: ${{ always() }}
+        id: result
         run: |
-          report="target/dependency-check-report.json"
-          if [ ! -f "${report}" ]; then
-            echo "Không tìm thấy ${report}" >> "$GITHUB_STEP_SUMMARY"
-            exit 0
-          fi
+          set -euo pipefail
+          crit_high=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL" or .Severity=="HIGH")] | length' trivy-report.json)
+          echo "crit_high=${crit_high}" >> "$GITHUB_OUTPUT"
           {
-            echo "### OWASP Dependency-Check"
+            echo "### Trivy SCA"
             echo ""
             echo "| Mức độ | Số lỗ hổng |"
             echo "|---|---|"
-            jq -r '[.dependencies[]?.vulnerabilities[]? | (.severity // "UNKNOWN") | ascii_upcase]
-                   | group_by(.) | map("| \(.[0]) | \(length) |") | .[]' "${report}"
+            jq -r '[.Results[]?.Vulnerabilities[]? | (.Severity // "UNKNOWN")]
+                   | group_by(.) | map("| \(.[0]) | \(length) |") | .[]' trivy-report.json
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Đẩy SARIF lên GitHub Code Scanning
-        if: ${{ always() && hashFiles('target/dependency-check-report.sarif') != '' }}
+        if: ${{ always() && hashFiles('trivy.sarif') != '' }}
         uses: github/codeql-action/upload-sarif@v4.37.3
         with:
-          sarif_file: target/dependency-check-report.sarif
-          category: dependency-check
+          sarif_file: trivy.sarif
+          category: trivy-sca
 
       - name: Lưu báo cáo
         if: ${{ always() }}
         uses: actions/upload-artifact@v7.0.1
         with:
-          name: dependency-check-report
+          name: trivy-report
           path: |
-            target/dependency-check-report.html
-            target/dependency-check-report.json
-            target/dependency-check-report.sarif
+            trivy-report.json
+            trivy.sarif
+            sbom.cdx.json
           if-no-files-found: ignore
           retention-days: 30
+
+      - name: Quality gate - SCA
+        if: ${{ env.ENFORCE_GATE == 'true' && steps.result.outputs.crit_high != '0' }}
+        run: |
+          echo "::error::Trivy phát hiện ${{ steps.result.outputs.crit_high }} lỗ hổng Critical/High."
+          exit 1
