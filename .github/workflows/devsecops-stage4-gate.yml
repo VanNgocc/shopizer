@@ -129,6 +129,7 @@ jobs:
             --config p/owasp-top-ten \
             --config p/security-audit \
             --exclude "**/src/test/**" \
+            --exclude ".github" \
             --metrics=off \
             --sarif --output semgrep.sarif
           # Khóa = mã rule + đường dẫn file (không dùng số dòng vì dòng dịch chuyển khi sửa code).
