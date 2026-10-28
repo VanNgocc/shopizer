@@ -2,7 +2,7 @@ dockerfile.security.missing-user.missing-user|sm-shop/Dockerfile
 java.lang.security.audit.cbc-padding-oracle.cbc-padding-oracle|sm-core/src/main/java/com/salesmanager/core/business/modules/utils/EncryptionImpl.java
 java.lang.security.audit.crypto.des-is-deprecated.des-is-deprecated|sm-shop/src/main/java/com/salesmanager/shop/utils/TokenizeTool.java
 java.lang.security.audit.crypto.desede-is-deprecated.desede-is-deprecated|sm-shop/src/main/java/com/salesmanager/shop/utils/TokenizeTool.java
-java.lang.security.audit.crypto.use-of-aes-ecb.use-of-aes-ecb|sm-shop/src/main/java/com/salesmanager/shop/utils/TokenizeTool.java
+
 java.spring.security.audit.spring-actuator-fully-enabled.spring-actuator-fully-enabled|sm-shop/src/main/resources/application.properties
 java.spring.security.audit.spring-csrf-disabled.spring-csrf-disabled|sm-shop/src/main/java/com/salesmanager/shop/application/config/MultipleEntryPointsSecurityConfig.java
 java.spring.security.unrestricted-request-mapping.unrestricted-request-mapping|sm-shop/src/main/java/com/salesmanager/shop/controller/FilesController.java
