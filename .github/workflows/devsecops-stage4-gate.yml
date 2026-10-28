@@ -1,0 +1,252 @@
+# DevSecOps pipeline - Giai đoạn 4b: quality gate dựa trên baseline
+# Đặt file này tại: .github/workflows/devsecops-stage4-gate.yml
+# Cùng với thư mục security-gate/ (gate.sh, exceptions.txt, baseline/).
+#
+# Ý tưởng: không chặn theo tổng số Critical/High (baseline đã có 44 Critical), mà chỉ chặn
+# khi xuất hiện finding MỚI so với baseline và chưa có ngoại lệ còn hạn.
+#
+# Quy trình dùng:
+#   1. Chạy workflow thủ công (Actions > Run workflow) với generate_baseline = true
+#      trên nhánh baseline-3.2.5. Tải 3 artifact keys-*, đặt vào security-gate/baseline/
+#      với tên trivy.txt, semgrep.txt, gitleaks.txt rồi commit.
+#   2. Để ENFORCE_GATE = "false" khi chạy thử; khi thấy kết quả đúng thì đổi thành "true".
+#
+# Lưu ý: finding Trivy gồm cả CVE mới được công bố cho dependency cũ, nên một PR không đổi
+# gì vẫn có thể đỏ nếu có CVE mới. Xử lý bằng ngoại lệ có hạn hoặc cập nhật baseline có chủ đích.
+
+name: DevSecOps - Giai đoạn 4b (Quality gate)
+
+on:
+  pull_request:
+  push:
+    branches: [baseline-3.2.5]
+  schedule:
+    - cron: "0 3 * * 1" # Thứ Hai hằng tuần (UTC)
+  workflow_dispatch:
+    inputs:
+      generate_baseline:
+        description: "Chỉ sinh file khóa để tạo baseline, không chạy gate"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: devsecops-stage4-gate-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ENFORCE_GATE: "false"
+  GITLEAKS_VERSION: "8.30.0"
+  SEMGREP_VERSION: "1.170.0"
+  TRIVY_VERSION: "0.76.1"
+  BASELINE_DIR: "security-gate/baseline"
+  EXCEPTIONS_FILE: "security-gate/exceptions.txt"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  gate-secrets:
+    name: Gate - secret (gitleaks)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout (lấy đủ lịch sử git)
+        uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Cài gitleaks (có kiểm tra checksum)
+        run: |
+          set -euo pipefail
+          base="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}"
+          file="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -sSfL "${base}/${file}" -o "${file}"
+          curl -sSfL "${base}/gitleaks_${GITLEAKS_VERSION}_checksums.txt" -o checksums.txt
+          grep " ${file}\$" checksums.txt | sha256sum -c -
+          tar -xzf "${file}" gitleaks
+          ./gitleaks version
+
+      - name: Quét secret và tạo khóa finding
+        run: |
+          set -euo pipefail
+          ./gitleaks git --redact \
+            --report-format json --report-path gitleaks.json \
+            --exit-code 0
+          # Khóa = mã rule + fingerprint (commit, file, rule, dòng); ổn định với commit cũ.
+          jq -r '.[]? | "\(.RuleID)|\(.Fingerprint)"' gitleaks.json | sort -u > keys-gitleaks.txt
+          echo "Số khóa: $(wc -l < keys-gitleaks.txt)"
+
+      - name: So sánh với baseline
+        id: gate
+        if: ${{ github.event.inputs.generate_baseline != 'true' }}
+        run: |
+          sed -i 's/\r$//' security-gate/gate.sh
+          bash security-gate/gate.sh "gitleaks" keys-gitleaks.txt \
+            "${BASELINE_DIR}/gitleaks.txt" "${EXCEPTIONS_FILE}"
+
+      - name: Lưu khóa finding
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: keys-gitleaks
+          path: keys-gitleaks.txt
+          if-no-files-found: ignore
+          retention-days: 30
+
+      - name: Quality gate - secret
+        if: ${{ env.ENFORCE_GATE == 'true' && steps.gate.outputs.new_count != '' && steps.gate.outputs.new_count != '0' }}
+        run: |
+          echo "::error::Có ${{ steps.gate.outputs.new_count }} secret mới so với baseline."
+          exit 1
+
+  # ---------------------------------------------------------------------------
+  gate-sast:
+    name: Gate - SAST (Semgrep)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Cài Semgrep
+        run: |
+          set -euo pipefail
+          python3 -m venv "${RUNNER_TEMP}/semgrep-venv"
+          "${RUNNER_TEMP}/semgrep-venv/bin/pip" install --quiet "semgrep==${SEMGREP_VERSION}"
+          "${RUNNER_TEMP}/semgrep-venv/bin/semgrep" --version
+
+      - name: Quét SAST và tạo khóa finding
+        env:
+          SEMGREP_SEND_METRICS: "off"
+        run: |
+          set -euo pipefail
+          "${RUNNER_TEMP}/semgrep-venv/bin/semgrep" scan \
+            --config p/java \
+            --config p/owasp-top-ten \
+            --config p/security-audit \
+            --exclude "**/src/test/**" \
+            --metrics=off \
+            --sarif --output semgrep.sarif
+          # Khóa = mã rule + đường dẫn file (không dùng số dòng vì dòng dịch chuyển khi sửa code).
+          jq -r '.runs[]?.results[]? | "\(.ruleId)|\(.locations[0].physicalLocation.artifactLocation.uri // "?")"' \
+            semgrep.sarif | sort -u > keys-semgrep.txt
+          echo "Số khóa: $(wc -l < keys-semgrep.txt)"
+
+      - name: So sánh với baseline
+        id: gate
+        if: ${{ github.event.inputs.generate_baseline != 'true' }}
+        run: |
+          sed -i 's/\r$//' security-gate/gate.sh
+          bash security-gate/gate.sh "semgrep" keys-semgrep.txt \
+            "${BASELINE_DIR}/semgrep.txt" "${EXCEPTIONS_FILE}"
+
+      - name: Lưu khóa finding
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: keys-semgrep
+          path: keys-semgrep.txt
+          if-no-files-found: ignore
+          retention-days: 30
+
+      - name: Quality gate - SAST
+        if: ${{ env.ENFORCE_GATE == 'true' && steps.gate.outputs.new_count != '' && steps.gate.outputs.new_count != '0' }}
+        run: |
+          echo "::error::Semgrep có ${{ steps.gate.outputs.new_count }} finding mới so với baseline."
+          exit 1
+
+  # ---------------------------------------------------------------------------
+  gate-sca:
+    name: Gate - SCA (Trivy, Critical/High)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Chọn JDK 11
+        run: |
+          set -euo pipefail
+          test -n "${JAVA_HOME_11_X64:-}" || { echo "::error::Runner không có JDK 11 cài sẵn"; exit 1; }
+          echo "JAVA_HOME=${JAVA_HOME_11_X64}" >> "$GITHUB_ENV"
+          echo "${JAVA_HOME_11_X64}/bin" >> "$GITHUB_PATH"
+
+      - name: Cache Maven
+        uses: actions/cache@v6.1.0
+        with:
+          path: ~/.m2/repository
+          key: maven-${{ hashFiles('**/pom.xml') }}
+          restore-keys: |
+            maven-
+
+      - name: Build (để Maven resolve đủ dependency và module nội bộ)
+        run: |
+          set -euo pipefail
+          chmod +x ./mvnw
+          ./mvnw -B -DskipTests \
+            -Dorg.slf4j.simpleLogger.log.org.apache.maven.cli.transfer.Slf4jMavenTransferListener=warn \
+            package
+
+      - name: Cài Trivy (có kiểm tra checksum)
+        run: |
+          set -euo pipefail
+          base="https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}"
+          file="trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          curl -sSfL "${base}/${file}" -o "${file}"
+          curl -sSfL "${base}/trivy_${TRIVY_VERSION}_checksums.txt" -o trivy-checksums.txt
+          grep " ${file}\$" trivy-checksums.txt | sha256sum -c -
+          tar -xzf "${file}" trivy
+          ./trivy --version
+
+      - name: Tính khóa cache theo tuần
+        id: week
+        run: echo "week=$(date -u +%G-W%V)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache CSDL lỗ hổng của Trivy
+        uses: actions/cache@v6.1.0
+        with:
+          path: ~/.cache/trivy
+          key: trivy-db-${{ steps.week.outputs.week }}
+          restore-keys: |
+            trivy-db-
+
+      - name: Quét SCA và tạo khóa finding
+        run: |
+          set -euo pipefail
+          ./trivy fs . --scanners vuln --severity CRITICAL,HIGH \
+            --format json --output trivy-gate.json
+          # Khóa = mã lỗ hổng + gói (không kèm phiên bản, để nâng cấp phiên bản vẫn so sánh được).
+          jq -r '.Results[]?.Vulnerabilities[]? | "\(.VulnerabilityID)|\(.PkgName)"' \
+            trivy-gate.json | sort -u > keys-trivy.txt
+          echo "Số khóa Critical/High (duy nhất): $(wc -l < keys-trivy.txt)"
+
+      - name: So sánh với baseline
+        id: gate
+        if: ${{ github.event.inputs.generate_baseline != 'true' }}
+        run: |
+          sed -i 's/\r$//' security-gate/gate.sh
+          bash security-gate/gate.sh "trivy (Critical/High)" keys-trivy.txt \
+            "${BASELINE_DIR}/trivy.txt" "${EXCEPTIONS_FILE}"
+
+      - name: Lưu khóa finding và báo cáo
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: keys-trivy
+          path: |
+            keys-trivy.txt
+            trivy-gate.json
+          if-no-files-found: ignore
+          retention-days: 30
+
+      - name: Quality gate - SCA
+        if: ${{ env.ENFORCE_GATE == 'true' && steps.gate.outputs.new_count != '' && steps.gate.outputs.new_count != '0' }}
+        run: |
+          echo "::error::Trivy có ${{ steps.gate.outputs.new_count }} lỗ hổng Critical/High mới so với baseline."
+          exit 1

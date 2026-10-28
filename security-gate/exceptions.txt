@@ -1,0 +1,11 @@
+# Ngoại lệ cho quality gate (finding MỚI được chấp nhận tạm thời).
+# Mỗi dòng:  KHÓA;;YYYY-MM-DD;;lý do
+#   KHÓA       : copy nguyên dòng finding từ summary của pipeline
+#                trivy   -> CVE-xxxx-xxxx|nhóm:artifact
+#                semgrep -> mã-rule|đường/dẫn/file
+#                gitleaks-> mã-rule|fingerprint
+#   Ngày       : ngoại lệ có hiệu lực đến hết ngày này; quá hạn thì finding bị tính là mới trở lại.
+#   Lý do      : bắt buộc ghi, để người chấm bài và nhóm hiểu vì sao chấp nhận.
+#
+# Ví dụ (xóa dấu # để dùng):
+# CVE-2099-0001|org.example:demo-lib;;2026-12-31;;Chưa có bản vá, thư viện chỉ dùng trong test
