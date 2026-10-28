@@ -24,7 +24,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  ENFORCE_GATE: "false"
+  ENFORCE_GATE: "true"
   NEWMAN_VERSION: "6.2.1" # kiểm tra lại bản mới nhất trên npm trước khi chốt
   APP_URL: "http://localhost:8080"
   READY_TIMEOUT_SECONDS: "180"
