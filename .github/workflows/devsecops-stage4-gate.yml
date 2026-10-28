@@ -37,7 +37,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  ENFORCE_GATE: "false"
+  ENFORCE_GATE: "true"
   GITLEAKS_VERSION: "8.30.0"
   SEMGREP_VERSION: "1.170.0"
   TRIVY_VERSION: "0.76.1"
