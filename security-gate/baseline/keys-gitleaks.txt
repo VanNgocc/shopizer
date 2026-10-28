@@ -1,0 +1,8 @@
+generic-api-key|052d2ed3c026525329405cef433c0aca7dd2cee3:sm-core/src/main/java/com/salesmanager/core/business/modules/integration/payment/impl/PayPalExpressCheckoutPayment.java:generic-api-key:316
+generic-api-key|052d2ed3c026525329405cef433c0aca7dd2cee3:sm-core/src/main/resources/profiles/local/shopizer-core.properties:generic-api-key:98
+generic-api-key|052d2ed3c026525329405cef433c0aca7dd2cee3:sm-core/src/main/resources/profiles/local/shopizer-core.properties:generic-api-key:99
+generic-api-key|052d2ed3c026525329405cef433c0aca7dd2cee3:sm-core/src/main/resources/profiles/mysql/shopizer-core.properties:generic-api-key:123
+generic-api-key|052d2ed3c026525329405cef433c0aca7dd2cee3:sm-core/src/main/resources/profiles/mysql/shopizer-core.properties:generic-api-key:124
+generic-api-key|052d2ed3c026525329405cef433c0aca7dd2cee3:sm-core/src/main/resources/shopizer-core.properties:generic-api-key:103
+generic-api-key|052d2ed3c026525329405cef433c0aca7dd2cee3:sm-core/src/main/resources/shopizer-core.properties:generic-api-key:104
+generic-api-key|052d2ed3c026525329405cef433c0aca7dd2cee3:sm-shop/src/main/resources/vault.properties:generic-api-key:2
