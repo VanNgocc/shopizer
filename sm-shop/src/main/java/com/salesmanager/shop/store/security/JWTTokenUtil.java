@@ -1,11 +1,19 @@
 package com.salesmanager.shop.store.security;
 
 import java.io.Serializable;
+import java.nio.charset.StandardCharsets;
+import java.security.GeneralSecurityException;
+import java.security.MessageDigest;
+import java.util.Arrays;
+import java.util.Base64;
 import java.util.Calendar;
 import java.util.Date;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.function.Function;
+
+import javax.crypto.Mac;
+import javax.crypto.spec.SecretKeySpec;
 
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.security.core.userdetails.UserDetails;
@@ -26,168 +34,197 @@ import io.jsonwebtoken.SignatureAlgorithm;
 @Component
 public class JWTTokenUtil implements Serializable {
 
-	/**
-	 * 
-	 */
 	private static final long serialVersionUID = 1L;
-	
-	
-	    static final int GRACE_PERIOD = 200;
-	
-	
-	
-	 	static final String CLAIM_KEY_USERNAME = "sub";
-	    static final String CLAIM_KEY_AUDIENCE = "aud";
-	    static final String CLAIM_KEY_CREATED = "iat";
 
-	    static final String AUDIENCE_UNKNOWN = "unknown";
-	    static final String AUDIENCE_API = "api";
-	    static final String AUDIENCE_WEB = "web";
-	    static final String AUDIENCE_MOBILE = "mobile";
-	    static final String AUDIENCE_TABLET = "tablet";
+	static final int GRACE_PERIOD = 200;
 
+	static final String CLAIM_KEY_USERNAME = "sub";
+	static final String CLAIM_KEY_AUDIENCE = "aud";
+	static final String CLAIM_KEY_CREATED = "iat";
+	// [FIX CVE-2022-23063] claim phien ban mat khau
+	static final String CLAIM_KEY_PWV = "pwv";
 
-	    @Value("${jwt.secret}")
-	    private String secret;
+	static final String AUDIENCE_UNKNOWN = "unknown";
+	static final String AUDIENCE_API = "api";
+	static final String AUDIENCE_WEB = "web";
+	static final String AUDIENCE_MOBILE = "mobile";
+	static final String AUDIENCE_TABLET = "tablet";
 
-	    @Value("${jwt.expiration}")
-	    private Long expiration;
+	@Value("${jwt.secret}")
+	private String secret;
 
-	    public String getUsernameFromToken(String token) {
-	        return getClaimFromToken(token, Claims::getSubject);
-	    }
+	@Value("${jwt.expiration}")
+	private Long expiration;
 
-	    public Date getIssuedAtDateFromToken(String token) {
-	        return getClaimFromToken(token, Claims::getIssuedAt);
-	    }
+	public String getUsernameFromToken(String token) {
+		return getClaimFromToken(token, Claims::getSubject);
+	}
 
-	    public Date getExpirationDateFromToken(String token) {
-	        return getClaimFromToken(token, Claims::getExpiration);
-	    }
+	public Date getIssuedAtDateFromToken(String token) {
+		return getClaimFromToken(token, Claims::getIssuedAt);
+	}
 
-	    public String getAudienceFromToken(String token) {
-	        return getClaimFromToken(token, Claims::getAudience);
-	    }
+	public Date getExpirationDateFromToken(String token) {
+		return getClaimFromToken(token, Claims::getExpiration);
+	}
 
-	    public <T> T getClaimFromToken(String token, Function<Claims, T> claimsResolver) {
-	        final Claims claims = getAllClaimsFromToken(token);
-	        return claimsResolver.apply(claims);
-	    }
+	public String getAudienceFromToken(String token) {
+		return getClaimFromToken(token, Claims::getAudience);
+	}
 
-	    private Claims getAllClaimsFromToken(String token) {
-	        return Jwts.parser()
-	                .setSigningKey(secret)
-	                .parseClaimsJws(token)
-	                .getBody();
-	    }
+	public <T> T getClaimFromToken(String token, Function<Claims, T> claimsResolver) {
+		final Claims claims = getAllClaimsFromToken(token);
+		return claimsResolver.apply(claims);
+	}
 
-	    private Boolean isTokenExpired(String token) {
-	        final Date expiration = getExpirationDateFromToken(token);
-	        return expiration.before(DateUtil.getDate());
-	    }
-	    
-	    private Boolean isTokenExpiredWithGrace(String token) {
-	            Date expiration = getExpirationDateFromToken(token);
-	            expiration = addSeconds(expiration,GRACE_PERIOD);
-	            return expiration.before(DateUtil.getDate());
-	    }
+	private Claims getAllClaimsFromToken(String token) {
+		return Jwts.parser()
+				.setSigningKey(secret)
+				.parseClaimsJws(token)
+				.getBody();
+	}
 
-	    private Boolean isCreatedBeforeLastPasswordReset(Date created, Date lastPasswordReset) {
-	        return (lastPasswordReset != null && created.before(lastPasswordReset));
-	    }
-	    
-	    private Boolean isCreatedBeforeLastPasswordResetWithGrace(Date created, Date lastPasswordReset) {
-	        return (lastPasswordReset != null && created.before(addSeconds(lastPasswordReset,GRACE_PERIOD)));
-	    }
-	    
-	    private Date addSeconds(Date date, Integer seconds) {
-	      Calendar cal = Calendar.getInstance();
-	      cal.setTime(date);
-	      cal.add(Calendar.SECOND, seconds);
-	      return cal.getTime();
-	    }
+	private Boolean isTokenExpired(String token) {
+		final Date expiration = getExpirationDateFromToken(token);
+		return expiration.before(DateUtil.getDate());
+	}
 
-	    private String generateAudience() {
-	        return AUDIENCE_API;
-	    }
+	private Boolean isTokenExpiredWithGrace(String token) {
+		Date expiration = getExpirationDateFromToken(token);
+		expiration = addSeconds(expiration, GRACE_PERIOD);
+		return expiration.before(DateUtil.getDate());
+	}
 
-	    private Boolean ignoreTokenExpiration(String token) {
-	        String audience = getAudienceFromToken(token);
-	        return (AUDIENCE_TABLET.equals(audience) || AUDIENCE_MOBILE.equals(audience));
-	    }
+	private Boolean isCreatedBeforeLastPasswordReset(Date created, Date lastPasswordReset) {
+		return (lastPasswordReset != null && created.before(lastPasswordReset));
+	}
 
-	    public String generateToken(UserDetails userDetails) {
-	        Map<String, Object> claims = new HashMap<>();
-	        return doGenerateToken(claims, userDetails.getUsername(), generateAudience());
-	    }
+	private Boolean isCreatedBeforeLastPasswordResetWithGrace(Date created, Date lastPasswordReset) {
+		return (lastPasswordReset != null && created.before(addSeconds(lastPasswordReset, GRACE_PERIOD)));
+	}
 
-	    private String doGenerateToken(Map<String, Object> claims, String subject, String audience) {
-	        final Date createdDate = DateUtil.getDate();
-	        final Date expirationDate = calculateExpirationDate(createdDate);
+	private Date addSeconds(Date date, Integer seconds) {
+		Calendar cal = Calendar.getInstance();
+		cal.setTime(date);
+		cal.add(Calendar.SECOND, seconds);
+		return cal.getTime();
+	}
 
-	        System.out.println("doGenerateToken " + createdDate);
+	private String generateAudience() {
+		return AUDIENCE_API;
+	}
 
-	        return Jwts.builder()
-	                .setClaims(claims)
-	                .setSubject(subject)
-	                .setAudience(audience)
-	                .setIssuedAt(createdDate)
-	                .setExpiration(expirationDate)
-	                .signWith(SignatureAlgorithm.HS512, secret)
-	                .compact();
-	    }
-	    
-        public Boolean canTokenBeRefreshedWithGrace(String token, Date lastPasswordReset) {
-          final Date created = getIssuedAtDateFromToken(token);
-          boolean t = isCreatedBeforeLastPasswordResetWithGrace(created, lastPasswordReset);
-          boolean u = isTokenExpiredWithGrace(token);
-          boolean v =  ignoreTokenExpiration(token);
-          System.out.println(t + " " +  u + " " + v);
-          System.out.println(!isCreatedBeforeLastPasswordResetWithGrace(created, lastPasswordReset)
-                  && (!isTokenExpiredWithGrace(token) || ignoreTokenExpiration(token)));
-          //return !isCreatedBeforeLastPasswordResetWithGrace(created, lastPasswordReset)
-          //        && (!isTokenExpired(token) || ignoreTokenExpiration(token));
-          return true;
-        }	    
+	private Boolean ignoreTokenExpiration(String token) {
+		String audience = getAudienceFromToken(token);
+		return (AUDIENCE_TABLET.equals(audience) || AUDIENCE_MOBILE.equals(audience));
+	}
 
-	    public Boolean canTokenBeRefreshed(String token, Date lastPasswordReset) {
-	        final Date created = getIssuedAtDateFromToken(token);
-	        return !isCreatedBeforeLastPasswordReset(created, lastPasswordReset)
-	                && (!isTokenExpired(token) || ignoreTokenExpiration(token));
-	    }
+	// [FIX CVE-2022-23063] Dau vet cua mat khau hien tai. Dung HMAC bang secret cua server
+	// de token (chi duoc ky, khong ma hoa) khong lam lo hash mat khau.
+	private String passwordVersion(String storedPasswordHash) {
+		if (storedPasswordHash == null) {
+			return null;
+		}
+		try {
+			Mac mac = Mac.getInstance("HmacSHA256");
+			mac.init(new SecretKeySpec(secret.getBytes(StandardCharsets.UTF_8), "HmacSHA256"));
+			byte[] out = mac.doFinal(storedPasswordHash.getBytes(StandardCharsets.UTF_8));
+			return Base64.getUrlEncoder().withoutPadding().encodeToString(Arrays.copyOf(out, 16));
+		} catch (GeneralSecurityException e) {
+			throw new IllegalStateException("Cannot compute password version", e);
+		}
+	}
 
-	    public String refreshToken(String token) {
-	        final Date createdDate = DateUtil.getDate();
-	        final Date expirationDate = calculateExpirationDate(createdDate);
+	// [FIX CVE-2022-23063] Token chi hop le neu claim pwv khop voi mat khau hien tai trong DB.
+	public boolean isPasswordVersionValid(String token, UserDetails userDetails) {
+    	String tokenPwv = getClaimFromToken(token, c -> c.get(CLAIM_KEY_PWV, String.class));
+    	String currentPwv = passwordVersion(userDetails.getPassword());
+    	if (tokenPwv == null || currentPwv == null) {
+        	return false;
+   		}
+    	return MessageDigest.isEqual(
+            	tokenPwv.getBytes(StandardCharsets.UTF_8),
+            	currentPwv.getBytes(StandardCharsets.UTF_8));
+	}
 
-	        final Claims claims = getAllClaimsFromToken(token);
-	        claims.setIssuedAt(createdDate);
-	        claims.setExpiration(expirationDate);
+	public String generateToken(UserDetails userDetails) {
+		Map<String, Object> claims = new HashMap<>();
+		// [FIX CVE-2022-23063] gan phien ban mat khau vao token
+		String pwv = passwordVersion(userDetails.getPassword());
+		if (pwv != null) {
+			claims.put(CLAIM_KEY_PWV, pwv);
+		}
+		return doGenerateToken(claims, userDetails.getUsername(), generateAudience());
+	}
 
-	        return Jwts.builder()
-	                .setClaims(claims)
-	                .signWith(SignatureAlgorithm.HS512, secret)
-	                .compact();
-	    }
+	private String doGenerateToken(Map<String, Object> claims, String subject, String audience) {
+		final Date createdDate = DateUtil.getDate();
+		final Date expirationDate = calculateExpirationDate(createdDate);
 
-	    public Boolean validateToken(String token, UserDetails userDetails) {
-	        JWTUser user = (JWTUser) userDetails;
-	        final String username = getUsernameFromToken(token);
-	        final Date created = getIssuedAtDateFromToken(token);
-	        //final Date expiration = getExpirationDateFromToken(token);
-	        
-	        boolean usernameEquals = username.equals(user.getUsername());
-	        boolean isTokenExpired = isTokenExpired(token);
-	        boolean isTokenCreatedBeforeLastPasswordReset = isCreatedBeforeLastPasswordReset(created, user.getLastPasswordResetDate());
-	        
-	        return (
+		System.out.println("doGenerateToken " + createdDate);
 
-	        		usernameEquals && !isTokenExpired && !isTokenCreatedBeforeLastPasswordReset
-	        );
-	    }
+		return Jwts.builder()
+				.setClaims(claims)
+				.setSubject(subject)
+				.setAudience(audience)
+				.setIssuedAt(createdDate)
+				.setExpiration(expirationDate)
+				.signWith(SignatureAlgorithm.HS512, secret)
+				.compact();
+	}
 
-	    private Date calculateExpirationDate(Date createdDate) {
-	        return new Date(createdDate.getTime() + expiration * 1000);
-	    }
+	public Boolean canTokenBeRefreshedWithGrace(String token, Date lastPasswordReset) {
+		final Date created = getIssuedAtDateFromToken(token);
+		boolean t = isCreatedBeforeLastPasswordResetWithGrace(created, lastPasswordReset);
+		boolean u = isTokenExpiredWithGrace(token);
+		boolean v = ignoreTokenExpiration(token);
+		System.out.println(t + " " + u + " " + v);
+		System.out.println(!isCreatedBeforeLastPasswordResetWithGrace(created, lastPasswordReset)
+				&& (!isTokenExpiredWithGrace(token) || ignoreTokenExpiration(token)));
+		//return !isCreatedBeforeLastPasswordResetWithGrace(created, lastPasswordReset)
+		//        && (!isTokenExpired(token) || ignoreTokenExpiration(token));
+		return true;
+	}
+
+	public Boolean canTokenBeRefreshed(String token, Date lastPasswordReset) {
+		final Date created = getIssuedAtDateFromToken(token);
+		return !isCreatedBeforeLastPasswordReset(created, lastPasswordReset)
+				&& (!isTokenExpired(token) || ignoreTokenExpiration(token));
+	}
+
+	public String refreshToken(String token) {
+		final Date createdDate = DateUtil.getDate();
+		final Date expirationDate = calculateExpirationDate(createdDate);
+
+		final Claims claims = getAllClaimsFromToken(token);
+		claims.setIssuedAt(createdDate);
+		claims.setExpiration(expirationDate);
+
+		return Jwts.builder()
+				.setClaims(claims)
+				.signWith(SignatureAlgorithm.HS512, secret)
+				.compact();
+	}
+
+	public Boolean validateToken(String token, UserDetails userDetails) {
+		JWTUser user = (JWTUser) userDetails;
+		final String username = getUsernameFromToken(token);
+		final Date created = getIssuedAtDateFromToken(token);
+		//final Date expiration = getExpirationDateFromToken(token);
+
+		boolean usernameEquals = username.equals(user.getUsername());
+		boolean isTokenExpired = isTokenExpired(token);
+		boolean isTokenCreatedBeforeLastPasswordReset = isCreatedBeforeLastPasswordReset(created, user.getLastPasswordResetDate());
+
+		return (
+				usernameEquals && !isTokenExpired && !isTokenCreatedBeforeLastPasswordReset
+				// [FIX CVE-2022-23063] tu choi token phat hanh truoc khi doi mat khau
+				&& isPasswordVersionValid(token, userDetails)
+		);
+	}
+
+	private Date calculateExpirationDate(Date createdDate) {
+		return new Date(createdDate.getTime() + expiration * 1000);
+	}
 
 }
