@@ -30,6 +30,8 @@ import com.salesmanager.shop.store.security.customer.JWTCustomerAuthenticationPr
 import com.salesmanager.shop.store.security.services.CredentialsService;
 import com.salesmanager.shop.store.security.services.CredentialsServiceImpl;
 
+import org.springframework.security.config.http.SessionCreationPolicy;
+
 /**
  * Main entry point for security - admin - customer - auth - private - services
  * 
@@ -393,6 +395,8 @@ public class MultipleEntryPointsSecurityConfig {
 			http
 			
 				.antMatcher(API_VERSION + "/auth/**")
+				.sessionManagement().sessionCreationPolicy(SessionCreationPolicy.STATELESS)
+        		.and()
 				.authorizeRequests()
 					.antMatchers(API_VERSION + "/auth/refresh").permitAll()
 					.antMatchers(API_VERSION + "/auth/login").permitAll()
